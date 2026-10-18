@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  metadata:
+    name: lockfile + version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # A binary crate must keep Cargo.lock committed: the release builds and
+      # both `--locked` invocations below depend on it.
+      - name: Cargo.lock is committed and up to date
+        run: |
+          if [ ! -f Cargo.lock ]; then
+            echo "::error file=Cargo.lock::Cargo.lock is not committed; run 'cargo generate-lockfile' and commit it."
+            exit 1
+          fi
+          cargo fetch --locked
+          git diff --exit-code -- Cargo.lock
+
+      # src/const.rs carries its own VERSION that the binary reports at
+      # runtime; it must not drift from Cargo.toml or release archives get
+      # named for a version the binary does not report.
+      - name: const::VERSION matches Cargo.toml
+        run: |
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          const_version="$(sed -n 's/^pub const VERSION: &str = "\(.*\)";/\1/p' src/const.rs | head -n 1)"
+          echo "Cargo.toml: ${cargo_version}  const.rs: ${const_version}"
+          if [ -z "$const_version" ]; then
+            echo "::error file=src/const.rs::could not read 'pub const VERSION' from src/const.rs"
+            exit 1
+          fi
+          if [ "$cargo_version" != "$const_version" ]; then
+            echo "::error file=src/const.rs::VERSION (${const_version}) does not match Cargo.toml (${cargo_version})"
+            exit 1
+          fi
+
+  test:
+    name: test (${{ matrix.os }})
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --all-targets --locked
+
+      # Compiling the release profile on every OS catches platform-specific
+      # breakage before a tag is cut.
+      - name: cargo build --release
+        run: cargo build --release --locked
